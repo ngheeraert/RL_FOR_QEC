@@ -1,4 +1,5 @@
 import numpy as np
+from scipy.linalg import expm
 from scipy.integrate import solve_ivp, complex_ode
 import matplotlib.pyplot as plt
 import sys
@@ -28,26 +29,26 @@ class system(object):
         self.hsdim = 2**self.N_qubits
         self.last_action = 0
         
-        self.rho0_t0 = np.zeros( (self.hsdim, self.hsdim), dtype='complex' )
-        self.drhox_t0 = np.zeros( (self.hsdim, self.hsdim), dtype='float' )
-        self.drhoy_t0 = np.zeros( (self.hsdim, self.hsdim), dtype='complex' )
-        self.drhoz_t0 = np.zeros( (self.hsdim, self.hsdim), dtype='float' )
-        self.rho0 = np.zeros( (self.hsdim, self.hsdim), dtype='complex' )
-        self.drhox = np.zeros( (self.hsdim, self.hsdim), dtype='float' )
-        self.drhoy = np.zeros( (self.hsdim, self.hsdim), dtype='complex' )
-        self.drhoz = np.zeros( (self.hsdim, self.hsdim), dtype='float' )
+        self.rho0_t0 = np.zeros( (self.hsdim, self.hsdim), dtype=np.complex128 )
+        self.drhox_t0 = np.zeros( (self.hsdim, self.hsdim), dtype=np.complex128 )
+        self.drhoy_t0 = np.zeros( (self.hsdim, self.hsdim), dtype=np.complex128 )
+        self.drhoz_t0 = np.zeros( (self.hsdim, self.hsdim), dtype=np.complex128 )
+        self.rho0  = np.zeros((self.hsdim, self.hsdim), dtype=np.complex128)
+        self.drhox = np.zeros((self.hsdim, self.hsdim), dtype=np.complex128)
+        self.drhoy = np.zeros((self.hsdim, self.hsdim), dtype=np.complex128)
+        self.drhoz = np.zeros((self.hsdim, self.hsdim), dtype=np.complex128)
         
         """ 
         IMPORTANT: rhon only evaluated when needed
         """
-        self.rhon = np.zeros( (self.hsdim, self.hsdim), dtype='complex' )
+        self.rhon = np.zeros( (self.hsdim, self.hsdim), dtype=np.complex128 )
         
         self.initialise_rho_t0_mats()
         self.initialise_rho_mats()
         
-        self.Sig_x = np.zeros( (self.hsdim, self.hsdim, self.N_qubits), dtype='float' )
-        self.Sig_y = np.zeros( (self.hsdim, self.hsdim, self.N_qubits), dtype='complex' )
-        self.Sig_z = np.zeros( (self.hsdim, self.hsdim, self.N_qubits), dtype='float' )
+        self.Sig_x = np.zeros((self.hsdim, self.hsdim, self.N_qubits), dtype=np.complex128)
+        self.Sig_y = np.zeros((self.hsdim, self.hsdim, self.N_qubits), dtype=np.complex128)
+        self.Sig_z = np.zeros((self.hsdim, self.hsdim, self.N_qubits), dtype=np.complex128)
         self.initialise_sigmas()
         
         
@@ -66,6 +67,18 @@ class system(object):
                 st_small.append(int( z ))
                 
             self.state_map[i] =  st_small 
+
+        # --- Precompute X_q permutation using state_map (bit-order safe) ---
+        # map Z-eigenvalue signature -> basis index
+        _sig2idx = {tuple(self.state_map[i]): i for i in range(self.hsdim)}
+
+        self._perm_x = np.empty((self.N_qubits, self.hsdim), dtype=np.int64)
+        
+        for q in range(self.N_qubits):
+            for i in range(self.hsdim):
+                sig = list(self.state_map[i])
+                sig[q] *= -1  # X flips Z eigenvalue on that qubit
+                self._perm_x[q, i] = _sig2idx[tuple(sig)]
         
         #-- [None,0,1,2,3,4,5,6,7,8,9,10,11,0,1,2,3,0,1,2,3]
         self.actions = [None]
@@ -82,7 +95,7 @@ class system(object):
                 self.cnot_pairs.append([i,j])
                 self.cnot_pairs.append([j,i])
             
-        self.cnots = np.zeros( (self.hsdim, self.hsdim, N*(N-1)), dtype='float' )
+        self.cnots = np.zeros( (self.hsdim, self.hsdim, N*(N-1)), dtype=np.complex128 )
         for k, qubits in enumerate( self.cnot_pairs ):
             self.cnots[:,:,k] = np.identity(self.hsdim)
             qb1 = qubits[0]
@@ -108,8 +121,8 @@ class system(object):
         #== a dictionary to keep track of the meaning of each state 
         #== i.e. : [.,.,.,.,.,.,.,.] <-> [.,.,.] for a 3 qubit system
         
-        self.Pz_up = np.zeros( (self.hsdim, self.hsdim, self.N_qubits), dtype='float' )
-        self.Pz_down = np.zeros( (self.hsdim, self.hsdim, self.N_qubits), dtype='float' )
+        self.Pz_up = np.zeros( (self.hsdim, self.hsdim, self.N_qubits), dtype=np.complex128 )
+        self.Pz_down = np.zeros( (self.hsdim, self.hsdim, self.N_qubits), dtype=np.complex128 )
         for j in range(self.N_qubits):
             for i in range(self.hsdim):
                 if self.state_map[i][j] == 1:
@@ -118,7 +131,24 @@ class system(object):
                     self.Pz_down[i,i,j] = 1
                 else:
                     print("-- EROOR IN STATE MAP --")
-        
+
+
+        # --- Precompute one-step propagator for bit-flip channel ---
+        # Vectorization convention: vec(dm) is dm.reshape(hsdim*hsdim)
+        I = np.eye(self.hsdim, dtype=np.complex128)
+        S = np.zeros((self.hsdim**2, self.hsdim**2), dtype=np.complex128)
+
+        for q in range(self.N_qubits):
+            X = self.Sig_x[:, :, q].astype(complex)
+            S += np.kron(X, X.conj())
+
+        S -= self.N_qubits * np.kron(I, I)
+        S *= (1.0 / self.T_dec)
+
+        # One-step map: vec(dm_{t+dt}) = E @ vec(dm_t)
+        self._E = expm(S * self.Delta_t)
+        self._E = np.asarray(self._E, dtype=np.complex128, order="C")
+        print("computed expm")
         
     def initialise_sigmas(self):
         
@@ -150,7 +180,6 @@ class system(object):
             self.Sig_x[:,:,i] = mq1x
             self.Sig_y[:,:,i] = mq1y
             self.Sig_z[:,:,i] = mq1z
-        
         
     def initialise_rho_t0_mats( self ):
         
@@ -227,11 +256,19 @@ class system(object):
         sq_eig_times_vecs1 = np.zeros_like(vecs1)
         sq_eig_times_vecs2 = np.zeros_like(vecs2)
         sq_eig_times_vecs3 = np.zeros_like(vecs3)
+
+        #-- OLD CODE
         for i in range( self.hsdim ):
             sq_eig_times_vecs0[i] = np.sqrt(eig0[i]) * vecs0[:,i]
             sq_eig_times_vecs1[i] = np.sqrt(eig1[i]) * vecs1[:,i]
             sq_eig_times_vecs2[i] = np.sqrt(eig2[i]) * vecs2[:,i]
             sq_eig_times_vecs3[i] = np.sqrt(eig3[i]) * vecs3[:,i]
+
+        #-- NEW CODE
+        #sq_eig_times_vecs0 = vecs0 * np.sqrt(eig0)[None, :]
+        #sq_eig_times_vecs1 = vecs1 * np.sqrt(eig1)[None, :]
+        #sq_eig_times_vecs2 = vecs2 * np.sqrt(eig2)[None, :]
+        #sq_eig_times_vecs3 = vecs3 * np.sqrt(eig3)[None, :]
         
         N_1D = np.prod( rho0_input.shape )
         rho0_input = sq_eig_times_vecs0[:,argsort0[np.arange(0,nb_vecs)]].reshape( N_1D )
@@ -247,6 +284,7 @@ class system(object):
         nn_input = np.append( nn_input, np.real(rho3_input) )
         nn_input = np.append( nn_input, np.imag(rho3_input) )
         
+        #-- OLD CODE
         bools = []
         for i in range( self.N_qubits ):
             meas_outcome = np.real( np.trace( self.Pz_up[:,:,i].dot(self.drhox) ) )
@@ -267,6 +305,18 @@ class system(object):
             meas_outcome = np.real( np.trace( self.Pz_down[:,:,i].dot(self.drhoz) ) )
             if np.abs(meas_outcome) < 1e-8: bools.append(0)
             else: bools.append(1)
+
+        #-- NEW CODE
+        # traces: Tr(P dm) for each qubit projector Pz_{up/down} and each drho
+        #up_x   = np.real(np.einsum('abq,ba->q', self.Pz_up,   self.drhox, optimize=True))
+        #down_x = np.real(np.einsum('abq,ba->q', self.Pz_down, self.drhox, optimize=True))
+        #up_y   = np.real(np.einsum('abq,ba->q', self.Pz_up,   self.drhoy, optimize=True))
+        #down_y = np.real(np.einsum('abq,ba->q', self.Pz_down, self.drhoy, optimize=True))
+        #up_z   = np.real(np.einsum('abq,ba->q', self.Pz_up,   self.drhoz, optimize=True))
+        #down_z = np.real(np.einsum('abq,ba->q', self.Pz_down, self.drhoz, optimize=True))
+
+        #vals = np.concatenate([up_x, down_x, up_y, down_y, up_z, down_z])
+        #bools = (np.abs(vals) >= 1e-8).astype(int).tolist()
             
         
         nn_input = np.append( nn_input, bools )
@@ -332,51 +382,102 @@ class system(object):
 
     def bit_flip_RHS( self, t, dm_1D ):
         
+        #-- OLD CODE
         dm = dm_1D.reshape( self.hsdim, self.hsdim )
         dm_bf = np.zeros_like(dm)
         for i in range( self.N_qubits ):
             dm_bf += self.Sig_x[:,:,i].dot(dm).dot(self.Sig_x[:,:,i]) - dm
-        
+
+        dm = dm_1D.reshape(self.hsdim, self.hsdim)
+
+        # sum_q X_q dm X_q  (einsum sums over q)
+        #X = self.Sig_x.astype(complex)  # (hs, hs, N)
+        #XdmX = np.einsum('ijq,jk,klq->il', X, dm, X, optimize=True)
+
+        #dm_bf = XdmX - self.N_qubits * dm
+        #
         dm_bf_1D = (1/self.T_dec)*dm_bf.reshape( np.prod(dm_bf.shape[:]) )
             
         return dm_bf_1D
     
     def time_evolve( self ):
     
-        rho0_1D = self.rho0.reshape( self.hsdim**2 )
-        drhox_1D = self.drhox.reshape( self.hsdim**2 )
-        drhoy_1D = self.drhoy.reshape( self.hsdim**2 )
-        drhoz_1D = self.drhoz.reshape( self.hsdim**2 )
-        
-        integrator = complex_ode( self.bit_flip_RHS )
-        
-        integrator.set_initial_value(rho0_1D, self.t)
-        sol_rho0 = integrator.integrate( self.t+self.Delta_t )
-        integrator.set_initial_value(drhox_1D, self.t)
-        sol_drhox = integrator.integrate( self.t+self.Delta_t )
-        integrator.set_initial_value(drhoy_1D, self.t)
-        sol_drhoy = integrator.integrate( self.t+self.Delta_t )
-        integrator.set_initial_value(drhoz_1D, self.t)
-        sol_drhoz = integrator.integrate( self.t+self.Delta_t )
-        
-        self.rho0 = sol_rho0.reshape( self.hsdim, self.hsdim )
-        self.drhox = sol_drhox.reshape( self.hsdim, self.hsdim )
-        self.drhoy = sol_drhoy.reshape( self.hsdim, self.hsdim )
-        self.drhoz = sol_drhoz.reshape( self.hsdim, self.hsdim )
-        self.t = self.t + self.Delta_t
-        
-        #-- USING SOLVE_IVP
-        
-        #ts = [self.t, self.t+self.Delta_t]
-        #sol_rho0_2 = solve_ivp(  self.bit_flip_RHS, ts, rho0_1D, t_eval=ts, vectorized=True )
-        #sol_drhox_2 = solve_ivp(  self.bit_flip_RHS, ts, drhox_1D, t_eval=ts, vectorized=True )
-        #sol_drhoy_2 = solve_ivp(  self.bit_flip_RHS, ts, drhoy_1D, t_eval=ts, vectorized=True )
-        #sol_drhoz_2 = solve_ivp(  self.bit_flip_RHS, ts, drhoz_1D, t_eval=ts, vectorized=True )
+        #-- OLD CODE
+        #rho0_1D = self.rho0.reshape( self.hsdim**2 )
+        #drhox_1D = self.drhox.reshape( self.hsdim**2 )
+        #drhoy_1D = self.drhoy.reshape( self.hsdim**2 )
+        #drhoz_1D = self.drhoz.reshape( self.hsdim**2 )
         #
-        #self.rho0 = sol_rho0_2.y[:,-1].reshape( self.hsdim, self.hsdim )
-        #self.drhox = sol_drhox_2.y[:,-1].reshape( self.hsdim, self.hsdim )
-        #self.drhoy = sol_drhoy_2.y[:,-1].reshape( self.hsdim, self.hsdim )
-        #self.drhoz = sol_drhoz_2.y[:,-1].reshape( self.hsdim, self.hsdim )
+        #integrator = complex_ode( self.bit_flip_RHS )
+        #
+        #integrator.set_initial_value(rho0_1D, self.t)
+        #sol_rho0 = integrator.integrate( self.t+self.Delta_t )
+        #integrator.set_initial_value(drhox_1D, self.t)
+        #sol_drhox = integrator.integrate( self.t+self.Delta_t )
+        #integrator.set_initial_value(drhoy_1D, self.t)
+        #sol_drhoy = integrator.integrate( self.t+self.Delta_t )
+        #integrator.set_initial_value(drhoz_1D, self.t)
+        #sol_drhoz = integrator.integrate( self.t+self.Delta_t )
+        #
+        #self.rho0 = sol_rho0.reshape( self.hsdim, self.hsdim )
+        #self.drhox = sol_drhox.reshape( self.hsdim, self.hsdim )
+        #self.drhoy = sol_drhoy.reshape( self.hsdim, self.hsdim )
+        #self.drhoz = sol_drhoz.reshape( self.hsdim, self.hsdim )
+        #self.t = self.t + self.Delta_t
+
+        #--  NEW CODE
+        # Apply precomputed one-step propagator to all 4 matrices
+        #E = self._E
+
+        #rho0_1D  = E @ self.rho0.reshape(self.hsdim**2)
+        #drhox_1D = E @ self.drhox.reshape(self.hsdim**2)
+        #drhoy_1D = E @ self.drhoy.reshape(self.hsdim**2)
+        #drhoz_1D = E @ self.drhoz.reshape(self.hsdim**2)
+
+        #self.rho0  = rho0_1D.reshape(self.hsdim, self.hsdim)
+        #self.drhox = drhox_1D.reshape(self.hsdim, self.hsdim)
+        #self.drhoy = drhoy_1D.reshape(self.hsdim, self.hsdim)
+        #self.drhoz = drhoz_1D.reshape(self.hsdim, self.hsdim)
+
+        #self.t += self.Delta_t
+
+        #--  NEW NEW CODE
+        #E = self._E
+        #d = self.hsdim
+        #d2 = d*d
+
+        #X = np.vstack([
+        #    self.rho0.reshape(d2),
+        #    self.drhox.reshape(d2),
+        #    self.drhoy.reshape(d2),
+        #    self.drhoz.reshape(d2),
+        #])  # (4, d2), C-contig
+
+        #Y = X @ E.T  # one GEMM (often much faster than 4 GEMVs on Accelerate)
+
+        #self.rho0  = Y[0].reshape(d, d)
+        #self.drhox = Y[1].reshape(d, d)
+        #self.drhoy = Y[2].reshape(d, d)
+        #self.drhoz = Y[3].reshape(d, d)
+        #self.t += self.Delta_t
+
+        #--  NEW NEW NEW CODE
+        # exact channel parameter for d/dt rho = (1/T) (X rho X - rho)
+        p = 0.5 * (1.0 - np.exp(-2.0 * self.Delta_t / self.T_dec))
+        a = 1.0 - p
+        b = p
+
+        # Apply independent bit-flip channel on each qubit
+        for q in range(self.N_qubits):
+            perm = self._perm_x[q]
+
+            # X_q rho X_q is just row/col permutation by perm
+            self.rho0  = a*self.rho0  + b*self.rho0[np.ix_(perm, perm)]
+            self.drhox = a*self.drhox + b*self.drhox[np.ix_(perm, perm)]
+            self.drhoy = a*self.drhoy + b*self.drhoy[np.ix_(perm, perm)]
+            self.drhoz = a*self.drhoz + b*self.drhoz[np.ix_(perm, perm)]
+
+        self.t += self.Delta_t
         
     def apply_action( self, a ):
         
@@ -440,9 +541,15 @@ class system(object):
     
     def RQ( self ):
         
+        #-- OLD CODE
         drhox_eig, v = np.linalg.eig( self.drhox )
         drhoy_eig, v = np.linalg.eig( self.drhoy )
         drhoz_eig, v = np.linalg.eig( self.drhoz )
+
+        #-- NEW CODE
+        #drhox_eig = np.linalg.eigvalsh(self.drhox)
+        #drhoy_eig = np.linalg.eigvalsh(self.drhoy)
+        #drhoz_eig = np.linalg.eigvalsh(self.drhoz)
         
         trace_norm_drhox = np.sum( np.abs(drhox_eig) )
         trace_norm_drhoy = np.sum( np.abs(drhoy_eig) )
@@ -620,9 +727,8 @@ class system(object):
                 pass
         
         return obtained_outcome_prob, other_outcome_prob, s_other_outcome
-        
     
-    def partial_trace(self, rho, keep, optimize=False):
+    def partial_trace(self, rho, keep, optimize=True):
         
         """Calculate the partial trace
     
