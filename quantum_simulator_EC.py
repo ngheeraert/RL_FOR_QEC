@@ -737,8 +737,9 @@ class system(object):
         """
         
         #-- eval rhon only when needed!!!
-        self.eval_rhon()
-        qb1_dm = self.partial_trace(self.rhon, keep=[qb1])
+        #self.eval_rhon()
+        #qb1_dm = self.partial_trace(self.rhon, keep=[qb1])
+        qb1_dm = self.partial_trace(self.rho0, keep=[qb1])
         r = np.random.rand()
         
         if (np.trace(qb1_dm) > 1 + 1e-6) or (np.trace(qb1_dm) < 1 - 1e-6):
@@ -759,7 +760,9 @@ class system(object):
         other_outcome = None
         s_other_outcome = deepcopy(self)
         s_other_outcome.initialise_rho_mats()
-        if r < np.abs(qb1_dm[0,0]):
+
+        p_up = float(np.real(qb1_dm[0,0]))
+        if r < p_up:
             # project in up state
             if np.abs(np.trace(rho0_up))>1e-8:  #-- sanity if statement
                 rho0_up /= np.trace(rho0_up)
