@@ -24,7 +24,7 @@ def _to_np(x, dtype):
 
 class Agent:
     
-    def __init__(self, alpha=0.0001/np.sqrt(10), gamma=0.95, n_actions=4,
+    def __init__(self, alpha=0.0001, gamma=0.95, n_actions=4,
                  layer1_size=300, layer2_size=300, lambda_entr=5e-3):
 
         # --- Hyperparameters / coefficients (paper terminology) ---
@@ -34,6 +34,7 @@ class Agent:
         # kappa: smoothing factor for the running baseline b_t.
 
 
+        self.alpha = alpha
         self.kappa = 0.9
         self.lambda_pol = 4.0
         self.lambda_entr = lambda_entr
@@ -48,7 +49,7 @@ class Agent:
         # Policy network πθ(a|s): maps environment state representation -> action probabilities
         self.policy = PolicyGradientNetwork(n_actions, layer1_size, layer2_size)
         # Optimizer for θ (Adam is used here; policy-gradient itself comes from the loss below)
-        self.policy.compile(optimizer=Adam(learning_rate=alpha, beta_1=0.9, beta_2=0.999))
+        self.policy.compile(optimizer=Adam(learning_rate=self.alpha, beta_1=0.9, beta_2=0.999))
         self.number_of_epochs_trained = 0
         # Natural gradient (diagonal Fisher) settings
         # --- Natural policy gradient option ---
