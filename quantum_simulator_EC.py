@@ -292,7 +292,6 @@ class system(object):
         self.drhoy = copy(self.drhoy_t0)
         self.drhoz = copy(self.drhoz_t0)
         
-        
     def initialise_all( self ):
         # Reset environment to the initial channel (t=0) before starting a new trajectory.
 
@@ -302,7 +301,6 @@ class system(object):
         self.RQ_old = self.RQ()
         self.exp_RQ_old = self.RQ_old
         self.t = 0
-        
         
     def generate_net_input_state( self, nb_vecs ):
         # Build the neural-network input vector from the current channel representation.
@@ -410,65 +408,13 @@ class system(object):
         nn_input = np.append( nn_input, self.last_action )
         
         return nn_input
-        
-    def generate_net_input_FULL( self, nb_vecs ):
-        # Alternative (uncompressed) network input: flatten the full density matrices
-        # (rho0 and rho0+drho*) directly. Kept for experimentation.
 
-        
-        rho1 = copy(self.rho0) + copy(self.drhox)
-        rho2 = copy(self.rho0) + copy(self.drhoy)
-        rho3 = copy(self.rho0) + copy(self.drhoz)
-        
-        #-- density matrix input
-        N_1D = np.prod( self.rho0.shape )
-        rho0_input = self.rho0.reshape( N_1D )
-        rho1_input = rho1.reshape( N_1D )
-        rho2_input = rho2.reshape( N_1D )
-        rho3_input = rho3.reshape( N_1D )
-        
-        nn_input = np.append( np.real(rho0_input), np.imag(rho0_input) )
-        nn_input = np.append( nn_input, np.real(rho1_input) )
-        nn_input = np.append( nn_input, np.imag(rho1_input) )
-        nn_input = np.append( nn_input, np.real(rho2_input) )
-        nn_input = np.append( nn_input, np.imag(rho2_input) )
-        nn_input = np.append( nn_input, np.real(rho3_input) )
-        nn_input = np.append( nn_input, np.imag(rho3_input) )
-        
-        bools = []
-        for i in range( self.N_qubits ):
-            meas_outcome = np.real( np.trace( self.Pz_up[:,:,i].dot(self.drhox) ) )
-            if np.abs(meas_outcome) < 1e-8: bools.append(0)
-            else: bools.append(1)
-            meas_outcome = np.real( np.trace( self.Pz_down[:,:,i].dot(self.drhox) ) )
-            if np.abs(meas_outcome) < 1e-8: bools.append(0)
-            else: bools.append(1)
-            meas_outcome = np.real( np.trace( self.Pz_up[:,:,i].dot(self.drhoy) ) )
-            if np.abs(meas_outcome) < 1e-8: bools.append(0)
-            else: bools.append(1)
-            meas_outcome = np.real( np.trace( self.Pz_down[:,:,i].dot(self.drhoy) ) )
-            if np.abs(meas_outcome) < 1e-8: bools.append(0)
-            else: bools.append(1)
-            meas_outcome = np.real( np.trace( self.Pz_up[:,:,i].dot(self.drhoz) ) )
-            if np.abs(meas_outcome) < 1e-8: bools.append(0)
-            else: bools.append(1)
-            meas_outcome = np.real( np.trace( self.Pz_down[:,:,i].dot(self.drhoz) ) )
-            if np.abs(meas_outcome) < 1e-8: bools.append(0)
-            else: bools.append(1)
-            
-        
-        nn_input = np.append( nn_input, bools )
-        nn_input = np.append( nn_input, self.last_action )
-        
-        return nn_input
-    
     def make_dm( self, n ):
         # Single-qubit density matrix for Bloch vector n: ρ = 1/2(I + n·σ)
         
         den_mat = 0.5*( ide + n[0]*sig_x+n[1]*sig_y+n[2]*sig_z )
     
         return den_mat
-
 
     def bit_flip_RHS( self, t, dm_1D ):
         # Lindblad RHS for independent bit flips on each qubit:
@@ -583,73 +529,147 @@ class system(object):
             self.drhoz = a*self.drhoz + b*self.drhoz[np.ix_(perm, perm)]
 
         self.t += self.Delta_t
-        
-    def apply_action( self, a ):
-        # Apply a discrete action 'a' (selected by the policy) and return the rewards.
-        # For measurements, the environment branches stochastically; we also compute exp_RQ,
-        # the expected RQ averaged over both measurement outcomes, to provide a smoother reward.
 
-        
-        #-- actions for 4 qubits
-        #-- [None,0,1,2,3,4,5,6,7,8,9,10,11,0,1,2,3,0,1,2,3]
-        
-        N_cnots = self.N_qubits * (self.N_qubits-1)
-        
-        exp_RQ = None
+    def step(self, a):
+        RQ_t = self.RQ()
+
+        info = self.apply_action(a)   # no reward computed here
+        self.time_evolve()
+
+        Rbar_next = self.exp_RQ_after_step(info)  # handles measurement averaging
+        dt, T = self.Delta_t, self.T_single
+        r1 = 1.0 + (Rbar_next - RQ_t) / (2.0 * dt / T)
+
+        r2 = 0.0  # your catastrophe/threshold penalty
+        return r1, r2
+
+    def apply_action(self, a):
+        """
+        Apply a discrete action 'a' to the *current* channel state, but DO NOT compute reward here.
+
+        Returns an info dict describing what happened.
+        For measurements, also returns:
+          - obtained_outcome_prob (probability of the sampled outcome branch that self collapses into)
+          - other_outcome_prob
+          - s_other_outcome : a deep-copied system in the *other* measurement branch (at the same time t)
+        """
+        N_cnots = self.N_qubits * (self.N_qubits - 1)
+
+        info = {
+            "a": int(a),
+            "kind": None,
+            "is_measurement": False,
+            # measurement-specific (filled only if is_measurement True)
+            "obtained_outcome_prob": None,
+            "other_outcome_prob": None,
+            "s_other_outcome": None,
+            "meas_qubit": None,
+        }
+
         if a == 0:
-            #-- stay idle
-            pass
-            exp_RQ = self.RQ()
-            
-        elif a > 0 and a <= N_cnots:
-            #-- apply CNOT
+            # idle
+            info["kind"] = "IDLE"
+
+        elif 0 < a <= N_cnots:
+            # CNOT
+            info["kind"] = "CNOT"
             cnot_idx = self.actions[a]
-            #print("-- CNOT_applied on qubits: with idx", cnot_idx )
-            self.apply_CNOT( cnot_idx ) 
-            exp_RQ = self.RQ()
-            
-        elif a > N_cnots and a <= N_cnots + self.N_qubits:
-            #-- apply bit-flip
+            self.apply_CNOT(cnot_idx)
+
+        elif N_cnots < a <= N_cnots + self.N_qubits:
+            # bit-flip
+            info["kind"] = "BITFLIP"
             qubit_to_flip = self.actions[a]
-            self.apply_bit_flip( qubit_to_flip )
-            exp_RQ = self.RQ()
-            
-        elif a > N_cnots + self.N_qubits and a <= N_cnots + 2*self.N_qubits:
-            #-- apply z-measurement
+            self.apply_bit_flip(qubit_to_flip)
+
+        elif N_cnots + self.N_qubits < a <= N_cnots + 2 * self.N_qubits:
+            # Z-measurement
+            info["kind"] = "MEAS_Z"
+            info["is_measurement"] = True
             qubit_to_measure = self.actions[a]
-            obtained_outcome_prob, other_outcome_prob, s_other_outcome \
-                = self.apply_measurement_z( qubit_to_measure )
-            # the rewards 
-            exp_RQ = obtained_outcome_prob*self.RQ() \
-                        + other_outcome_prob*s_other_outcome.RQ()
-            
+            info["meas_qubit"] = int(qubit_to_measure)
+
+            obtained_outcome_prob, other_outcome_prob, s_other_outcome = self.apply_measurement_z(qubit_to_measure)
+
+            info["obtained_outcome_prob"] = float(obtained_outcome_prob)
+            info["other_outcome_prob"] = float(other_outcome_prob)
+            info["s_other_outcome"] = s_other_outcome
+
         else:
             print("====================")
             print("ERROR -- WRONG ACTION NUMBER")
             print("a = ", a)
             print("====================")
             sys.exit()
-            
-        reward1_, reward2_ = self.reward( exp_RQ )
-        self.RQ_old = self.RQ()
-        self.exp_RQ_old = exp_RQ
-        
-        return reward1_, reward2_
+
+        self.last_action = int(a)
+        return info
+
+    def exp_RQ_measurement_after_step(self, obtained_prob, other_prob, s_other_outcome, rq_obtained_post):
+        """
+        Compute the expected (averaged-over-outcomes) RQ *after the full time step* for a measurement action:
+            exp_RQ(t+Δt) = p_obt * RQ_obt(t+Δt) + p_other * RQ_other(t+Δt)
     
-    def reward( self, exp_RQ  ):
-        # Reward shaping used during RL training.
-        # reward1: dense signal that increases when expected RQ improves relative to previous step.
-        # reward2: sparse penalty when RQ collapses to ~0 (catastrophic information loss).
-
-        
-        reward1 = 0
-        reward2 = 0
-        
-        if exp_RQ > 1e-8:
-            reward1 = 1 + (exp_RQ-self.RQ_old)/(2*self.Delta_t/self.T_single)
-        if ( np.abs(self.RQ_old) > 1e-8 and np.abs(self.RQ()) < 1e-8 ):
-            reward2 = - self.P
-
+        Assumptions:
+          - self has already been evolved by time_evolve() to reach the obtained branch at t+Δt,
+            and rq_obtained_post = self.RQ() at that point.
+          - s_other_outcome represents the other post-measurement branch at time t (before dissipation).
+        """
+        # Evolve the other branch by the same dissipative map over Δt
+        s_other_outcome.time_evolve()
+        rq_other_post = s_other_outcome.RQ()
+    
+        return obtained_prob * rq_obtained_post + other_prob * rq_other_post
+    
+    def step_2(self, a):
+        """
+        One *atomic* RL step that matches the paper’s ordering for the reward:
+    
+          1) compute RQ(t)
+          2) apply action (unitary/measurement)
+          3) apply dissipation over Δt via time_evolve()
+          4) compute exp_RQ(t+Δt) (average over measurement outcomes if measurement)
+          5) compute (r1, r2) using exp_RQ(t+Δt) and RQ(t)
+    
+        Returns: (reward1, reward2)
+        """
+        # RQ(t) BEFORE any action/dissipation in this step
+        rq_t = self.RQ()
+    
+        info = self.apply_action(a)
+    
+        # Advance the *real* trajectory (sampled measurement branch if measurement)
+        self.time_evolve()
+    
+        if info["is_measurement"]:
+            # obtained branch after dissipation
+            rq_obtained_post = self.RQ()
+    
+            # expected post-step RQ averaged over both outcomes
+            exp_rq_post = self.exp_RQ_measurement_after_step(
+                obtained_prob=info["obtained_outcome_prob"],
+                other_prob=info["other_outcome_prob"],
+                s_other_outcome=info["s_other_outcome"],
+                rq_obtained_post=rq_obtained_post,
+            )
+        else:
+            # deterministic actions: post-step expected RQ is just current RQ after dissipation
+            exp_rq_post = self.RQ()
+    
+        # Reward shaping (same structure as your current reward(), but now aligned in time)
+        reward1 = 0.0
+        if exp_rq_post > 1e-8:
+            reward1 = 1.0 + (exp_rq_post - rq_t) / (2.0 * self.Delta_t / self.T_single)
+    
+        reward2 = 0.0
+        # Catastrophe penalty: compare pre-step rq_t vs post-step (current) RQ
+        if (abs(rq_t) > 1e-8) and (abs(self.RQ()) < 1e-8):
+            reward2 = -self.P
+    
+        # Optional: keep these for logging/diagnostics
+        self.exp_RQ_old = exp_rq_post
+        self.RQ_old = self.RQ()
+    
         return reward1, reward2
     
     def RQ( self ):
@@ -677,10 +697,8 @@ class system(object):
         
         return np.real(RQ)
             
-    
     def get_action_type(self, a):
         # Helper: decode the integer action index into a human-readable action type.
-
         
         N_cnots = self.N_qubits * (self.N_qubits-1)
         if a == 0:
@@ -696,7 +714,6 @@ class system(object):
             print("ERROR -- WRONG ACTION NUMBER")
             
         return action_type
-                    
         
     def apply_CNOT( self, i ):
         # Apply the i-th precomputed CNOT matrix to all 4 channel matrices.
@@ -711,7 +728,6 @@ class system(object):
         self.drhoy = self.cnots[:,:,i].dot(self.drhoy).dot(self.cnots[:,:,i])
         self.drhoz = self.cnots[:,:,i].dot(self.drhoz).dot(self.cnots[:,:,i])
         
-        
     def apply_bit_flip( self, qb1 ):
         # Apply a unitary X gate to qubit qb1 (distinct from the stochastic noise channel).
         # This is an *action* the agent can choose, e.g. as a corrective operation.
@@ -724,18 +740,11 @@ class system(object):
         self.drhoz = self.Sig_x[:,:,qb1].dot( self.drhoz ).dot( self.Sig_x[:,:,qb1] )
         self.eval_rhon()
         
-        
     def apply_measurement_z( self, qb1 ):
         # Perform a projective Z measurement on qubit qb1.
         # - Sample an outcome using the Born rule on the current state ρ(n) (rhon).
         # - Update (rho0, dρ*) by projecting and renormalizing.
         # - Also return a deep-copied 'other branch' system state so we can compute expected values.
-
-        
-        """ 
-        IMPORTANT: rhon only evaluated when needed
-        """
-        
         #-- eval rhon only when needed!!!
         #self.eval_rhon()
         #qb1_dm = self.partial_trace(self.rhon, keep=[qb1])
@@ -897,3 +906,125 @@ class system(object):
         rho_a = np.einsum(rho_a, idx1+idx2, optimize=optimize)
         
         return rho_a.reshape(Nkeep, Nkeep)
+#        
+#    def generate_net_input_FULL( self, nb_vecs ):
+#        # Alternative (uncompressed) network input: flatten the full density matrices
+#        # (rho0 and rho0+drho*) directly. Kept for experimentation.
+#
+#        
+#        rho1 = copy(self.rho0) + copy(self.drhox)
+#        rho2 = copy(self.rho0) + copy(self.drhoy)
+#        rho3 = copy(self.rho0) + copy(self.drhoz)
+#        
+#        #-- density matrix input
+#        N_1D = np.prod( self.rho0.shape )
+#        rho0_input = self.rho0.reshape( N_1D )
+#        rho1_input = rho1.reshape( N_1D )
+#        rho2_input = rho2.reshape( N_1D )
+#        rho3_input = rho3.reshape( N_1D )
+#        
+#        nn_input = np.append( np.real(rho0_input), np.imag(rho0_input) )
+#        nn_input = np.append( nn_input, np.real(rho1_input) )
+#        nn_input = np.append( nn_input, np.imag(rho1_input) )
+#        nn_input = np.append( nn_input, np.real(rho2_input) )
+#        nn_input = np.append( nn_input, np.imag(rho2_input) )
+#        nn_input = np.append( nn_input, np.real(rho3_input) )
+#        nn_input = np.append( nn_input, np.imag(rho3_input) )
+#        
+#        bools = []
+#        for i in range( self.N_qubits ):
+#            meas_outcome = np.real( np.trace( self.Pz_up[:,:,i].dot(self.drhox) ) )
+#            if np.abs(meas_outcome) < 1e-8: bools.append(0)
+#            else: bools.append(1)
+#            meas_outcome = np.real( np.trace( self.Pz_down[:,:,i].dot(self.drhox) ) )
+#            if np.abs(meas_outcome) < 1e-8: bools.append(0)
+#            else: bools.append(1)
+#            meas_outcome = np.real( np.trace( self.Pz_up[:,:,i].dot(self.drhoy) ) )
+#            if np.abs(meas_outcome) < 1e-8: bools.append(0)
+#            else: bools.append(1)
+#            meas_outcome = np.real( np.trace( self.Pz_down[:,:,i].dot(self.drhoy) ) )
+#            if np.abs(meas_outcome) < 1e-8: bools.append(0)
+#            else: bools.append(1)
+#            meas_outcome = np.real( np.trace( self.Pz_up[:,:,i].dot(self.drhoz) ) )
+#            if np.abs(meas_outcome) < 1e-8: bools.append(0)
+#            else: bools.append(1)
+#            meas_outcome = np.real( np.trace( self.Pz_down[:,:,i].dot(self.drhoz) ) )
+#            if np.abs(meas_outcome) < 1e-8: bools.append(0)
+#            else: bools.append(1)
+#            
+#        
+#        nn_input = np.append( nn_input, bools )
+#        nn_input = np.append( nn_input, self.last_action )
+#        
+#        return nn_input
+#    
+
+#        
+#    def apply_action( self, a ):
+#        # Apply a discrete action 'a' (selected by the policy) and return the rewards.
+#        # For measurements, the environment branches stochastically; we also compute exp_RQ,
+#        # the expected RQ averaged over both measurement outcomes, to provide a smoother reward.
+#
+#        
+#        #-- actions for 4 qubits
+#        #-- [None,0,1,2,3,4,5,6,7,8,9,10,11,0,1,2,3,0,1,2,3]
+#        
+#        N_cnots = self.N_qubits * (self.N_qubits-1)
+#        
+#        exp_RQ = None
+#        if a == 0:
+#            #-- stay idle
+#            pass
+#            exp_RQ = self.RQ()
+#            
+#        elif a > 0 and a <= N_cnots:
+#            #-- apply CNOT
+#            cnot_idx = self.actions[a]
+#            #print("-- CNOT_applied on qubits: with idx", cnot_idx )
+#            self.apply_CNOT( cnot_idx ) 
+#            exp_RQ = self.RQ()
+#            
+#        elif a > N_cnots and a <= N_cnots + self.N_qubits:
+#            #-- apply bit-flip
+#            qubit_to_flip = self.actions[a]
+#            self.apply_bit_flip( qubit_to_flip )
+#            exp_RQ = self.RQ()
+#            
+#        elif a > N_cnots + self.N_qubits and a <= N_cnots + 2*self.N_qubits:
+#            #-- apply z-measurement
+#            qubit_to_measure = self.actions[a]
+#            obtained_outcome_prob, other_outcome_prob, s_other_outcome \
+#                = self.apply_measurement_z( qubit_to_measure )
+#            # the rewards 
+#            exp_RQ = obtained_outcome_prob*self.RQ() \
+#                        + other_outcome_prob*s_other_outcome.RQ()
+#            
+#        else:
+#            print("====================")
+#            print("ERROR -- WRONG ACTION NUMBER")
+#            print("a = ", a)
+#            print("====================")
+#            sys.exit()
+#            
+#        reward1_, reward2_ = self.reward( exp_RQ )
+#        self.RQ_old = self.RQ()
+#        self.exp_RQ_old = exp_RQ
+#        self.last_action = a
+#        
+#        return reward1_, reward2_
+#    
+#    def reward( self, exp_RQ  ):
+#        # Reward shaping used during RL training.
+#        # reward1: dense signal that increases when expected RQ improves relative to previous step.
+#        # reward2: sparse penalty when RQ collapses to ~0 (catastrophic information loss).
+#
+#        
+#        reward1 = 0
+#        reward2 = 0
+#        
+#        if exp_RQ > 1e-8:
+#            reward1 = 1 + (exp_RQ-self.RQ_old)/(2*self.Delta_t/self.T_single)
+#        if ( np.abs(self.RQ_old) > 1e-8 and np.abs(self.RQ()) < 1e-8 ):
+#            reward2 = - self.P
+#
+#        return reward1, reward2
